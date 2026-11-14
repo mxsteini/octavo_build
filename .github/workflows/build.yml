@@ -1,0 +1,205 @@
+# Octavo Train – Windows-, macOS- und iOS-Builds.
+#
+# Diese Datei ist die EINZIGE Datei im GitHub-Build-Repo (.github/workflows/build.yml).
+# Vorlage und Doku: ci/github/ im GitLab-Repo, siehe ci/README.md.
+#
+# Ablauf: Der GitLab-Job "build-github" startet diesen Workflow per API, wartet
+# auf das Ende, lädt die Artefakte herunter, legt sie in GitLab ab und löscht
+# danach den Run (inklusive Logs und Artefakten). Es werden bewusst keine Caches
+# verwendet, damit auf GitHub nichts zurückbleibt.
+#
+# Secrets im GitHub-Repo:
+#   GITLAB_TOKEN                Deploy-Token (read_repository) des GitLab-Projekts – als SECRET
+#   GITLAB_USER                 Benutzername des Deploy-Tokens (Secret oder Variable)
+#   optional macOS-Signierung:  APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD,
+#                               APPLE_SIGNING_IDENTITY, APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID
+#   iOS (Pflicht für iOS):      IOS_CERTIFICATE, IOS_CERTIFICATE_PASSWORD,
+#                               IOS_MOBILE_PROVISION, APPLE_DEVELOPMENT_TEAM
+
+name: octavo-build
+run-name: octavo-build ${{ inputs.correlation_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: HTTPS-URL des GitLab-Repos
+        required: true
+      ref:
+        description: Branch oder Tag
+        required: true
+      sha:
+        description: Commit, der gebaut wird
+        required: true
+      correlation_id:
+        description: Kennung, über die GitLab den Run findet
+        required: true
+      platforms:
+        description: Komma-getrennt (windows,macos,ios) – macOS/iOS derzeit pausiert
+        default: windows
+
+permissions: {}
+
+env:
+  NODE_VERSION: "24"
+  REPO_URL: ${{ inputs.repo_url }}
+  BUILD_REF: ${{ inputs.ref }}
+  BUILD_SHA: ${{ inputs.sha }}
+
+jobs:
+  windows:
+    if: contains(inputs.platforms, 'windows')
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - &fetch
+        name: Quellcode von GitLab holen
+        shell: bash
+        env:
+          GITLAB_USER: ${{ secrets.GITLAB_USER || vars.GITLAB_USER }}
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          set -euo pipefail
+          auth="$(printf '%s:%s' "$GITLAB_USER" "$GITLAB_TOKEN" | base64 | tr -d '\n')"
+          echo "::add-mask::$auth"
+          git init -q src
+          cd src
+          git -c http.extraHeader="Authorization: Basic $auth" \
+            fetch -q --depth 1 "$REPO_URL" "$BUILD_REF"
+          git checkout -q FETCH_HEAD
+          if [ "$(git rev-parse HEAD)" != "$BUILD_SHA" ]; then
+            echo "::error::$BUILD_REF zeigt nicht mehr auf $BUILD_SHA"
+            exit 1
+          fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Bauen
+        working-directory: src
+        run: |
+          npm ci
+          npx tauri build --ci --bundles nsis,msi
+      - name: Artefakte einsammeln
+        working-directory: src
+        run: |
+          mkdir -p ../out
+          for f in src-tauri/target/release/bundle/nsis/*.exe src-tauri/target/release/bundle/msi/*.msi; do
+            cp "$f" "../out/$(basename "$f" | tr ' ' '-')"
+          done
+          ls -l ../out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/*
+          retention-days: 1
+          if-no-files-found: error
+
+  macos:
+    if: contains(inputs.platforms, 'macos')
+    runs-on: macos-latest
+    steps:
+      - *fetch
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Bauen (Universal)
+        working-directory: src
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          # Leere Secrets entfernen, sonst versucht Tauri mit leeren Werten zu signieren.
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                   APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            [ -n "${!v}" ] || unset "$v"
+          done
+          if [ -z "${APPLE_CERTIFICATE:-}" ]; then
+            echo "::warning::Keine Apple-Signierung konfiguriert – macOS-Build ist unsigniert."
+          fi
+          npm ci
+          npx tauri build --ci --target universal-apple-darwin --bundles dmg
+      - name: Artefakte einsammeln
+        working-directory: src
+        run: |
+          mkdir -p ../out
+          for f in src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg; do
+            cp "$f" "../out/$(basename "$f" | tr ' ' '-')"
+          done
+          ls -l ../out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: out/*
+          retention-days: 1
+          if-no-files-found: error
+
+  # Läuft auf Linux (günstig) und entscheidet, ob der iOS-Build möglich ist.
+  ios-check:
+    if: contains(inputs.platforms, 'ios')
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - id: check
+        env:
+          IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
+          IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
+          APPLE_DEVELOPMENT_TEAM: ${{ secrets.APPLE_DEVELOPMENT_TEAM }}
+        run: |
+          if [ -n "$IOS_CERTIFICATE" ] && [ -n "$IOS_MOBILE_PROVISION" ] && [ -n "$APPLE_DEVELOPMENT_TEAM" ]; then
+            echo "enabled=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "::warning::iOS übersprungen – IOS_CERTIFICATE, IOS_MOBILE_PROVISION und APPLE_DEVELOPMENT_TEAM fehlen."
+            echo "enabled=false" >>"$GITHUB_OUTPUT"
+          fi
+
+  ios:
+    needs: ios-check
+    if: needs.ios-check.outputs.enabled == 'true'
+    runs-on: macos-latest
+    steps:
+      - *fetch
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - name: Bauen (IPA)
+        working-directory: src
+        env:
+          IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
+          APPLE_DEVELOPMENT_TEAM: ${{ secrets.APPLE_DEVELOPMENT_TEAM }}
+        run: |
+          set -euo pipefail
+          npm ci
+          npx tauri ios init --ci
+          npx tauri icon public/logo-octavo-mark.svg
+          npx tauri ios build --ci --export-method app-store-connect
+      - name: Artefakte einsammeln
+        working-directory: src
+        run: |
+          mkdir -p ../out
+          find src-tauri/gen/apple/build -name '*.ipa' -print0 | while IFS= read -r -d '' f; do
+            cp "$f" "../out/$(basename "$f" | tr ' ' '-')"
+          done
+          ls -l ../out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios
+          path: out/*
+          retention-days: 1
+          if-no-files-found: error

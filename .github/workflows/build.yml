@@ -170,24 +170,28 @@ jobs:
         run: |
           set -euo pipefail
           npm ci
-          npx tauri ios init --ci
-          npx tauri icon public/logo-octavo-mark.svg
           mkdir -p ../out
           version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
 
           if [ -n "$IOS_CERTIFICATE" ] && [ -n "$IOS_MOBILE_PROVISION" ] && [ -n "$APPLE_DEVELOPMENT_TEAM" ]; then
+            npx tauri ios init --ci
+            npx tauri icon public/logo-octavo-mark.svg
             npx tauri ios build --ci --target aarch64 --export-method app-store-connect
             find src-tauri/gen/apple/build -name '*.ipa' -print0 | while IFS= read -r -d '' f; do
               cp "$f" "../out/$(basename "$f" .ipa | tr ' ' '-')_${version}.ipa"
             done
           else
             echo "::warning::Kein Apple-Zertifikat – iOS wird unsigniert gebaut (zum Selbstsignieren)."
-            unset IOS_CERTIFICATE IOS_CERTIFICATE_PASSWORD IOS_MOBILE_PROVISION APPLE_DEVELOPMENT_TEAM
+            unset IOS_CERTIFICATE IOS_CERTIFICATE_PASSWORD IOS_MOBILE_PROVISION
+            # Tauri verlangt eine Team-ID, auch wenn nicht signiert wird: Platzhalter.
+            export APPLE_DEVELOPMENT_TEAM=0000000000
             # Signierung für alle Targets abschalten (gilt auch für Tauris xcodebuild-Aufrufe).
             printf '%s\n' 'CODE_SIGNING_ALLOWED = NO' 'CODE_SIGNING_REQUIRED = NO' \
               'CODE_SIGN_IDENTITY =' 'CODE_SIGN_ENTITLEMENTS =' 'DEVELOPMENT_TEAM =' \
               >"$RUNNER_TEMP/unsigned.xcconfig"
             export XCODE_XCCONFIG_FILE="$RUNNER_TEMP/unsigned.xcconfig"
+            npx tauri ios init --ci
+            npx tauri icon public/logo-octavo-mark.svg
             # Das Archiv entsteht unsigniert; der anschließende Export (der eine Signatur
             # verlangt) darf scheitern. Die IPA wird danach aus dem Archiv gepackt.
             npx tauri ios build --ci --target aarch64 || echo "::notice::tauri ios build beendet mit Fehler (Export ohne Signatur erwartet)"

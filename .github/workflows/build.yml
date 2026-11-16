@@ -185,13 +185,18 @@ jobs:
             unset IOS_CERTIFICATE IOS_CERTIFICATE_PASSWORD IOS_MOBILE_PROVISION
             # Tauri verlangt eine Team-ID, auch wenn nicht signiert wird: Platzhalter.
             export APPLE_DEVELOPMENT_TEAM=0000000000
-            # Signierung für alle Targets abschalten (gilt auch für Tauris xcodebuild-Aufrufe).
-            printf '%s\n' 'CODE_SIGNING_ALLOWED = NO' 'CODE_SIGNING_REQUIRED = NO' \
-              'CODE_SIGN_IDENTITY =' 'CODE_SIGN_ENTITLEMENTS =' 'DEVELOPMENT_TEAM =' \
-              >"$RUNNER_TEMP/unsigned.xcconfig"
-            export XCODE_XCCONFIG_FILE="$RUNNER_TEMP/unsigned.xcconfig"
             npx tauri ios init --ci
             npx tauri icon public/logo-octavo-mark.svg
+            # Signierung im generierten Xcode-Projekt abschalten (Tauri reicht weder
+            # Build-Settings noch XCODE_XCCONFIG_FILE an xcodebuild durch).
+            pbx=src-tauri/gen/apple/octavo-train.xcodeproj/project.pbxproj
+            sed -i '' -E \
+              -e '/CODE_SIGN_STYLE = /d' \
+              -e '/"?CODE_SIGN_IDENTITY(\[sdk=iphoneos\*\])?"? = /d' \
+              -e '/DEVELOPMENT_TEAM = /d' \
+              -e 's/buildSettings = \{/buildSettings = { CODE_SIGN_STYLE = Manual; CODE_SIGNING_ALLOWED = NO; CODE_SIGNING_REQUIRED = NO; CODE_SIGN_IDENTITY = ""; DEVELOPMENT_TEAM = "";/' \
+              "$pbx"
+            grep -c 'CODE_SIGNING_ALLOWED = NO' "$pbx" || { echo "::error::Signierung im Xcode-Projekt nicht abgeschaltet"; exit 1; }
             # Das Archiv entsteht unsigniert; der anschließende Export (der eine Signatur
             # verlangt) darf scheitern. Die IPA wird danach aus dem Archiv gepackt.
             npx tauri ios build --ci --target aarch64 || echo "::notice::tauri ios build beendet mit Fehler (Export ohne Signatur erwartet)"

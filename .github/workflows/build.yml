@@ -13,8 +13,9 @@
 #   GITLAB_USER                 Benutzername des Deploy-Tokens (Secret oder Variable)
 #   optional macOS-Signierung:  APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD,
 #                               APPLE_SIGNING_IDENTITY, APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID
-#   iOS (Pflicht für iOS):      IOS_CERTIFICATE, IOS_CERTIFICATE_PASSWORD,
+#   optional iOS-Signierung:    IOS_CERTIFICATE, IOS_CERTIFICATE_PASSWORD,
 #                               IOS_MOBILE_PROVISION, APPLE_DEVELOPMENT_TEAM
+#                               (ohne: unsignierte IPA zum Selbstsignieren)
 
 name: octavo-build
 run-name: octavo-build ${{ inputs.correlation_id }}
@@ -35,8 +36,8 @@ on:
         description: Kennung, über die GitLab den Run findet
         required: true
       platforms:
-        description: Komma-getrennt (windows,macos,ios) – macOS/iOS derzeit pausiert
-        default: windows
+        description: Komma-getrennt (windows,macos,ios)
+        default: windows,ios
 
 permissions: {}
 
@@ -144,29 +145,12 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  # Läuft auf Linux (günstig) und entscheidet, ob der iOS-Build möglich ist.
-  ios-check:
-    if: contains(inputs.platforms, 'ios')
-    runs-on: ubuntu-latest
-    outputs:
-      enabled: ${{ steps.check.outputs.enabled }}
-    steps:
-      - id: check
-        env:
-          IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
-          IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
-          APPLE_DEVELOPMENT_TEAM: ${{ secrets.APPLE_DEVELOPMENT_TEAM }}
-        run: |
-          if [ -n "$IOS_CERTIFICATE" ] && [ -n "$IOS_MOBILE_PROVISION" ] && [ -n "$APPLE_DEVELOPMENT_TEAM" ]; then
-            echo "enabled=true" >>"$GITHUB_OUTPUT"
-          else
-            echo "::warning::iOS übersprungen – IOS_CERTIFICATE, IOS_MOBILE_PROVISION und APPLE_DEVELOPMENT_TEAM fehlen."
-            echo "enabled=false" >>"$GITHUB_OUTPUT"
-          fi
-
+  # iOS: Ohne Apple-Zertifikat entsteht eine UNSIGNIERTE IPA (…_unsigned.ipa), die man
+  # selbst signiert und installiert (z. B. mit Sideloader und kostenloser Apple-ID).
+  # Mit IOS_CERTIFICATE, IOS_MOBILE_PROVISION und APPLE_DEVELOPMENT_TEAM wird für den
+  # App Store signiert.
   ios:
-    needs: ios-check
-    if: needs.ios-check.outputs.enabled == 'true'
+    if: contains(inputs.platforms, 'ios')
     runs-on: macos-latest
     steps:
       - *fetch
@@ -188,14 +172,33 @@ jobs:
           npm ci
           npx tauri ios init --ci
           npx tauri icon public/logo-octavo-mark.svg
-          npx tauri ios build --ci --export-method app-store-connect
-      - name: Artefakte einsammeln
-        working-directory: src
-        run: |
           mkdir -p ../out
-          find src-tauri/gen/apple/build -name '*.ipa' -print0 | while IFS= read -r -d '' f; do
-            cp "$f" "../out/$(basename "$f" | tr ' ' '-')"
-          done
+          version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+
+          if [ -n "$IOS_CERTIFICATE" ] && [ -n "$IOS_MOBILE_PROVISION" ] && [ -n "$APPLE_DEVELOPMENT_TEAM" ]; then
+            npx tauri ios build --ci --target aarch64 --export-method app-store-connect
+            find src-tauri/gen/apple/build -name '*.ipa' -print0 | while IFS= read -r -d '' f; do
+              cp "$f" "../out/$(basename "$f" .ipa | tr ' ' '-')_${version}.ipa"
+            done
+          else
+            echo "::warning::Kein Apple-Zertifikat – iOS wird unsigniert gebaut (zum Selbstsignieren)."
+            unset IOS_CERTIFICATE IOS_CERTIFICATE_PASSWORD IOS_MOBILE_PROVISION APPLE_DEVELOPMENT_TEAM
+            # Signierung für alle Targets abschalten (gilt auch für Tauris xcodebuild-Aufrufe).
+            printf '%s\n' 'CODE_SIGNING_ALLOWED = NO' 'CODE_SIGNING_REQUIRED = NO' \
+              'CODE_SIGN_IDENTITY =' 'CODE_SIGN_ENTITLEMENTS =' 'DEVELOPMENT_TEAM =' \
+              >"$RUNNER_TEMP/unsigned.xcconfig"
+            export XCODE_XCCONFIG_FILE="$RUNNER_TEMP/unsigned.xcconfig"
+            # Das Archiv entsteht unsigniert; der anschließende Export (der eine Signatur
+            # verlangt) darf scheitern. Die IPA wird danach aus dem Archiv gepackt.
+            npx tauri ios build --ci --target aarch64 || echo "::notice::tauri ios build beendet mit Fehler (Export ohne Signatur erwartet)"
+            archive="$(find src-tauri/gen/apple -name '*.xcarchive' -type d -print -quit)"
+            app="$(find "${archive:?Kein .xcarchive gefunden}/Products/Applications" -maxdepth 1 -name '*.app' -print -quit)"
+            [ -n "$app" ] || { echo "::error::Keine .app im Archiv $archive"; exit 1; }
+            work="$RUNNER_TEMP/ipa"
+            mkdir -p "$work/Payload"
+            cp -R "$app" "$work/Payload/"
+            (cd "$work" && zip -qry "$GITHUB_WORKSPACE/out/Octavo-Train_${version}_unsigned.ipa" Payload)
+          fi
           ls -l ../out
       - uses: actions/upload-artifact@v4
         with:
